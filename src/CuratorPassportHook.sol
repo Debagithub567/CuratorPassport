@@ -7,28 +7,29 @@ import {IPoolManager, ModifyLiquidityParams} from "@uniswap/v4-core/src/interfac
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 
+/// @notice Observes liquidity modifications only for v4 pools configured with this hook.
+/// @dev Counts callbacks, not unique transactions or financial results. Before-callback
+///      state and logs survive only when the enclosing execution commits successfully.
 contract CuratorPassportHook is BaseHook {
     using PoolIdLibrary for PoolKey;
 
+    enum LiquidityOperation {
+        Addition,
+        Removal,
+        ZeroDelta
+    }
+
     mapping(PoolId => uint256) public liquidityAdditions;
     mapping(PoolId => uint256) public liquidityRemovals;
+    mapping(PoolId => uint256) public zeroDeltaModifications;
 
-    event LiquidityObserved(
-        bytes32 indexed poolId,
-        address indexed executionCaller,
-        bool isAddition
-    );
+    /// @dev executionCaller is the immediate PoolManager caller, often a PositionManager
+    ///      or router. It does not identify a curator. ZeroDelta does not prove fee collection.
+    event LiquidityObserved(bytes32 indexed poolId, address indexed executionCaller, LiquidityOperation operation);
 
-    constructor(IPoolManager _poolManager)
-        BaseHook(_poolManager)
-    {}
+    constructor(IPoolManager _poolManager) BaseHook(_poolManager) {}
 
-    function getHookPermissions()
-        public
-        pure
-        override
-        returns (Hooks.Permissions memory)
-    {
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: false,
             afterInitialize: false,
@@ -47,21 +48,16 @@ contract CuratorPassportHook is BaseHook {
         });
     }
 
-    function _beforeAddLiquidity(
-        address sender,
-        PoolKey calldata key,
-        ModifyLiquidityParams calldata,
-        bytes calldata
-    ) internal override returns (bytes4) {
+    function _beforeAddLiquidity(address sender, PoolKey calldata key, ModifyLiquidityParams calldata, bytes calldata)
+        internal
+        override
+        returns (bytes4)
+    {
         PoolId poolId = key.toId();
 
         liquidityAdditions[poolId]++;
 
-        emit LiquidityObserved(
-            PoolId.unwrap(poolId),
-            sender,
-            true
-        );
+        emit LiquidityObserved(PoolId.unwrap(poolId), sender, LiquidityOperation.Addition);
 
         return BaseHook.beforeAddLiquidity.selector;
     }
@@ -69,18 +65,22 @@ contract CuratorPassportHook is BaseHook {
     function _beforeRemoveLiquidity(
         address sender,
         PoolKey calldata key,
-        ModifyLiquidityParams calldata,
+        ModifyLiquidityParams calldata params,
         bytes calldata
     ) internal override returns (bytes4) {
         PoolId poolId = key.toId();
 
-        liquidityRemovals[poolId]++;
+        // v4 routes both negative and zero liquidity deltas to this callback.
+        LiquidityOperation operation;
+        if (params.liquidityDelta == 0) {
+            zeroDeltaModifications[poolId]++;
+            operation = LiquidityOperation.ZeroDelta;
+        } else {
+            liquidityRemovals[poolId]++;
+            operation = LiquidityOperation.Removal;
+        }
 
-        emit LiquidityObserved(
-            PoolId.unwrap(poolId),
-            sender,
-            false
-        );
+        emit LiquidityObserved(PoolId.unwrap(poolId), sender, operation);
 
         return BaseHook.beforeRemoveLiquidity.selector;
     }
